@@ -1,0 +1,19 @@
+[package]
+name = "armup"
+version = "0.1.0"
+edition = "2024"
+description = "Install embedded Cortex-M tools on Windows"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+dialoguer = "0.12.0"
+indicatif = "0.18.4"
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "json", "stream"] }
+serde = { version = "1.0.228", features = ["derive"] }
+tempfile = "3.27.0"
+tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread"] }
+winreg = "0.56.0"
+zip = "8.6.0"
