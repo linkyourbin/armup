@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display};
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -36,16 +37,6 @@ impl ToolKind {
             Self::Cmake => "cmake",
             Self::Ninja => "ninja",
             Self::XpackOpenocd => "xpack-openocd",
-        }
-    }
-
-    pub fn root_env_var(self) -> &'static str {
-        match self {
-            Self::ArmNoneEabiGcc => "ARM_GNU_TOOLCHAIN_ROOT",
-            Self::Clangd => "CLANGD_ROOT",
-            Self::Cmake => "CMAKE_ROOT",
-            Self::Ninja => "NINJA_ROOT",
-            Self::XpackOpenocd => "OPENOCD_ROOT",
         }
     }
 
@@ -93,5 +84,21 @@ impl ToolKind {
 impl Display for ToolKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.id())
+    }
+}
+
+impl FromStr for ToolKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "arm-none-eabi-gcc" | "gcc" | "arm-gcc" => Ok(Self::ArmNoneEabiGcc),
+            "clangd" => Ok(Self::Clangd),
+            "cmake" => Ok(Self::Cmake),
+            "ninja" => Ok(Self::Ninja),
+            "xpack-openocd" | "openocd" => Ok(Self::XpackOpenocd),
+            _ => Err(format!("unsupported tool {value:?}")),
+        }
     }
 }

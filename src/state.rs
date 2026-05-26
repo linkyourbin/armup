@@ -25,6 +25,35 @@ pub fn legacy_tool_versions_dir(root: &Path, kind: ToolKind) -> PathBuf {
     root.join(LEGACY_INSTALLS_DIR_NAME).join(kind.id())
 }
 
+pub fn cleanup_staging_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut removed = Vec::new();
+    for kind in ToolKind::all() {
+        let kind_root = tool_versions_dir(root, kind);
+        if !kind_root.exists() {
+            continue;
+        }
+
+        for entry in fs::read_dir(&kind_root)
+            .with_context(|| format!("failed to read {}", kind_root.display()))?
+        {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".staging-") {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+                removed.push(path);
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
 pub fn discover_installed_tools(root: &Path) -> Result<Vec<InstalledTool>> {
     let mut tools = Vec::new();
 
@@ -43,9 +72,14 @@ pub fn installed_tool_from_dir(
     version: impl Into<String>,
     install_dir: PathBuf,
 ) -> Result<InstalledTool> {
-    let executable_path = find_file_named(&install_dir, kind.executable_names()).with_context(|| {
-        format!("failed to locate {} in {}", kind.id(), install_dir.display())
-    })?;
+    let executable_path =
+        find_file_named(&install_dir, kind.executable_names()).with_context(|| {
+            format!(
+                "failed to locate {} in {}",
+                kind.id(),
+                install_dir.display()
+            )
+        })?;
     let executable_dir = executable_path
         .parent()
         .context("downloaded executable did not have a parent directory")?
@@ -54,7 +88,6 @@ pub fn installed_tool_from_dir(
     Ok(InstalledTool {
         kind,
         version: version.into(),
-        install_dir,
         executable_path,
         executable_dir,
     })
@@ -91,12 +124,7 @@ fn discover_installed_tool(root: &Path, kind: ToolKind) -> Result<Option<Install
         }
     }
 
-    candidates.sort_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| right.1.cmp(&left.1))
-    });
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
 
     Ok(candidates.into_iter().next().map(|(_, _, tool)| tool))
 }
@@ -142,7 +170,10 @@ mod tests {
 
     #[test]
     fn default_install_root_uses_embedded_toolchain_directory() {
-        assert_eq!(default_install_root(), PathBuf::from(r"D:\Embedded_Toolchain"));
+        assert_eq!(
+            default_install_root(),
+            PathBuf::from(r"D:\Embedded_Toolchain")
+        );
     }
 
     #[test]

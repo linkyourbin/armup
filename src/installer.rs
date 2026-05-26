@@ -1,64 +1,95 @@
-use anyhow::{Context, Result, bail};
-use indicatif::{ProgressBar, ProgressStyle};
+use anyhow::{Context, Result, anyhow, bail};
+use indicatif::HumanBytes;
 use reqwest::Client;
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT_RANGES, RANGE};
-use std::fs::{self, File};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tempfile::{NamedTempFile, TempPath};
 use tokio::task::JoinSet;
+use tokio::time::{sleep, timeout};
 use zip::ZipArchive;
 
 use crate::environment::{apply_user_environment, build_env_plan};
-use crate::resolver::resolve_tools;
 use crate::state::{
-    discover_installed_tools, installed_tool_from_dir, tool_version_dir, tool_versions_dir,
+    cleanup_staging_dirs, discover_installed_tools, installed_tool_from_dir, tool_version_dir,
+    tool_versions_dir,
 };
-use crate::tool::{EnvScope, ToolKind};
-use crate::types::{InstalledTool, ResolvedTool};
+use crate::tool::EnvScope;
+use crate::types::{ArchiveChecksum, ChecksumAlgorithm, InstalledTool, ResolvedTool};
 
 const MULTIPART_THRESHOLD_BYTES: u64 = 128 * 1024 * 1024;
 const MULTIPART_TARGET_PART_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 const MULTIPART_MAX_PARTS: u64 = 12;
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const RANGE_DOWNLOAD_MAX_ATTEMPTS: u32 = 8;
+const PROGRESS_RENDER_INTERVAL: Duration = Duration::from_millis(500);
+const PROGRESS_BAR_WIDTH: usize = 28;
+
+#[derive(Clone)]
+struct ProgressReporter {
+    inner: Arc<Mutex<ProgressReporterState>>,
+}
+
+struct ProgressReporterState {
+    downloads: BTreeMap<String, DownloadSnapshot>,
+    last_render: Instant,
+    rendered_lines: usize,
+}
+
+struct DownloadSnapshot {
+    total: u64,
+    downloaded: u64,
+    started: Instant,
+}
+
+#[derive(Clone)]
+struct DownloadTracker {
+    reporter: ProgressReporter,
+    label: String,
+}
 
 pub async fn install_tools(
     client: &Client,
     root: &Path,
-    tools: &[ToolKind],
+    packages: Vec<ResolvedTool>,
     scope: EnvScope,
 ) -> Result<()> {
-    println!("Resolving tool versions...");
-    let resolved = resolve_tools(client, tools).await?;
-
-    let (exclusive_packages, parallel_packages): (Vec<_>, Vec<_>) = resolved
-        .into_iter()
-        .partition(requires_exclusive_install);
-
-    for package in exclusive_packages {
-        println!("Preparing {} {}...", package.kind.id(), package.version);
-        install_one(client, root, &package).await?;
+    validate_install_root(root)?;
+    let cleaned = cleanup_staging_dirs(root)?;
+    for path in cleaned {
+        println!("Removed stale staging directory: {}", path.display());
     }
 
+    let progress = ProgressReporter::new();
     let mut tasks = JoinSet::new();
-    for package in parallel_packages {
+    for package in packages {
         let client = client.clone();
         let root = root.to_path_buf();
-        tasks.spawn(async move {
-            println!("Preparing {} {}...", package.kind.id(), package.version);
-            install_one(&client, &root, &package).await
-        });
+        let progress = progress.clone();
+        tasks.spawn(async move { install_one(&client, &root, &package, &progress).await });
     }
 
-    while let Some(result) = tasks.join_next().await {
-        result.context("tool install task failed")??;
+    let install_result = async {
+        while let Some(result) = tasks.join_next().await {
+            result.context("tool install task failed")??;
+        }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
+    progress.clear();
+    install_result?;
 
     let installed_tools = discover_installed_tools(root)?;
 
     let plan = build_env_plan(root, &installed_tools)?;
     if scope == EnvScope::User {
+        print_env_preview(root, &plan)?;
         apply_user_environment(root, &plan)?;
     }
 
@@ -73,38 +104,82 @@ pub async fn install_tools(
     }
 
     if scope == EnvScope::User {
-        println!("Updated HKCU\\Environment and PATH.");
+        println!("Updated user PATH.");
         println!("Open a new terminal to pick up the changes.");
     } else {
-        println!("Skipped environment registry changes.");
+        println!("Skipped PATH registry changes.");
     }
 
     Ok(())
 }
 
-fn requires_exclusive_install(package: &ResolvedTool) -> bool {
-    package.kind == ToolKind::ArmNoneEabiGcc
-        || package
-            .size_bytes
-            .is_some_and(|size| size >= MULTIPART_THRESHOLD_BYTES)
+pub fn validate_install_root(root: &Path) -> Result<()> {
+    if root.as_os_str().is_empty() {
+        bail!("install root cannot be empty");
+    }
+
+    if let Some(prefix) = root.components().next() {
+        if let Component::Prefix(prefix) = prefix {
+            let drive_root = PathBuf::from(format!("{}\\", prefix.as_os_str().to_string_lossy()));
+            if !drive_root.exists() {
+                bail!(
+                    "install drive {} does not exist. Create the drive or pass --root with an existing drive.",
+                    drive_root.display()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_env_preview(root: &Path, plan: &crate::types::EnvPlan) -> Result<()> {
+    let preview = crate::environment::preview_user_environment(root, plan)?;
+    println!("PATH update preview:");
+    if preview.removed_path_entries.is_empty()
+        && preview.added_path_entries.is_empty()
+        && preview.legacy_variables_present.is_empty()
+    {
+        println!("- No PATH changes needed.");
+    } else {
+        for entry in &preview.removed_path_entries {
+            println!("- Remove managed old PATH entry: {entry}");
+        }
+        for entry in &preview.added_path_entries {
+            println!("- Add PATH entry: {}", entry.display());
+        }
+        for variable in &preview.legacy_variables_present {
+            println!("- Remove legacy environment variable: {variable}");
+        }
+    }
+    println!(
+        "- Final user PATH entries: {}",
+        preview.final_path_entry_count
+    );
+    Ok(())
 }
 
 async fn install_one(
     client: &Client,
     root: &Path,
     package: &ResolvedTool,
+    progress: &ProgressReporter,
 ) -> Result<InstalledTool> {
     let install_dir = tool_version_dir(root, package.kind, &package.version);
 
     if install_dir.exists() {
-        println!(
-            "Using existing install at {}",
-            install_dir.display()
-        );
         return installed_tool_from_dir(package.kind, package.version.clone(), install_dir);
     }
 
-    let archive_path = download_archive(client, &package.download_url, &package.asset_name).await?;
+    let archive_path = download_archive(
+        client,
+        &package.download_url,
+        &package.asset_name,
+        package.kind.id(),
+        progress,
+    )
+    .await?;
+    verify_archive_checksum(archive_path.as_ref(), package)?;
 
     let tool_root = tool_versions_dir(root, package.kind);
     fs::create_dir_all(&tool_root)
@@ -134,26 +209,106 @@ async fn install_one(
     installed_tool_from_dir(package.kind, package.version.clone(), install_dir)
 }
 
-async fn download_archive(client: &Client, url: &str, asset_name: &str) -> Result<TempPath> {
+fn verify_archive_checksum(archive_path: &Path, package: &ResolvedTool) -> Result<()> {
+    let Some(checksum) = &package.checksum else {
+        println!(
+            "Checksum: no upstream checksum available for {} {}.",
+            package.kind.id(),
+            package.version
+        );
+        return Ok(());
+    };
+
+    match checksum.algorithm {
+        ChecksumAlgorithm::Sha256 => verify_sha256(archive_path, checksum).with_context(|| {
+            format!(
+                "checksum verification failed for {} {}",
+                package.kind.id(),
+                package.version
+            )
+        })?,
+    }
+
+    println!(
+        "Checksum: verified {} for {} {}.",
+        checksum.algorithm.label(),
+        package.kind.id(),
+        package.version
+    );
+    Ok(())
+}
+
+fn verify_sha256(path: &Path, checksum: &ArchiveChecksum) -> Result<()> {
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != checksum.value {
+        bail!(
+            "expected sha256 {}, got {} for {}",
+            checksum.value,
+            actual,
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
+impl ChecksumAlgorithm {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sha256 => "sha256",
+        }
+    }
+}
+
+async fn download_archive(
+    client: &Client,
+    url: &str,
+    asset_name: &str,
+    tool_label: &str,
+    progress: &ProgressReporter,
+) -> Result<TempPath> {
     if let Some((content_length, multipart_parts)) =
         probe_multipart_download(client, url, asset_name).await?
     {
-        println!(
-            "Using {multipart_parts} parallel connections for {asset_name} ({})",
-            indicatif::HumanBytes(content_length)
-        );
-        match download_archive_multipart(client, url, asset_name, content_length, multipart_parts).await
+        match download_archive_multipart(
+            client,
+            url,
+            asset_name,
+            tool_label,
+            content_length,
+            multipart_parts,
+            progress,
+        )
+        .await
         {
             Ok(path) => return Ok(path),
             Err(error) => {
-                eprintln!(
-                    "warning: parallel download failed for {asset_name}: {error:#}. Falling back to a single connection."
+                progress_log(
+                    progress,
+                    format!(
+                        "warning: parallel download failed after range retries for {asset_name}: {error:#}. Falling back to a single connection."
+                    ),
                 );
             }
         }
     }
 
-    download_archive_single(client, url, asset_name).await
+    download_archive_single(client, url, asset_name, tool_label, progress).await
 }
 
 async fn probe_multipart_download(
@@ -228,7 +383,13 @@ fn parse_content_range_total(header: &str) -> Option<u64> {
     total.parse().ok()
 }
 
-async fn download_archive_single(client: &Client, url: &str, asset_name: &str) -> Result<TempPath> {
+async fn download_archive_single(
+    client: &Client,
+    url: &str,
+    asset_name: &str,
+    tool_label: &str,
+    progress: &ProgressReporter,
+) -> Result<TempPath> {
     let mut response = client
         .get(url)
         .send()
@@ -238,54 +399,48 @@ async fn download_archive_single(client: &Client, url: &str, asset_name: &str) -
         .with_context(|| format!("download returned an error for {url}"))?;
 
     let total = response.content_length().unwrap_or(0);
-    let progress = (total >= MULTIPART_THRESHOLD_BYTES).then(|| {
-        let progress = ProgressBar::new(total);
-        progress.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} {msg} [{bar:32.cyan/blue}] {percent:>3}% {binary_bytes}/{total_bytes} {binary_bytes_per_sec} eta {eta}",
-            )
-            .expect("valid progress bar template")
-            .progress_chars("=>-"),
-        );
-        progress.set_message(format!("Downloading {asset_name}"));
-        progress
-    });
-    if progress.is_none() {
-        println!("Downloading {asset_name}...");
-    }
+    let tracker = progress.start_download(tool_label, total);
 
     let mut temp = NamedTempFile::new().context("failed to create a temporary download file")?;
-    while let Some(chunk) = response.chunk().await? {
-        temp.write_all(&chunk)
-            .context("failed to write downloaded archive chunk")?;
-        if let Some(progress) = &progress {
-            progress.inc(chunk.len() as u64);
+    let result = async {
+        loop {
+            let chunk = timeout(DOWNLOAD_IDLE_TIMEOUT, response.chunk())
+                .await
+                .with_context(|| {
+                    format!(
+                        "download stalled for {asset_name}: no data received for {} seconds",
+                        DOWNLOAD_IDLE_TIMEOUT.as_secs()
+                    )
+                })?
+                .with_context(|| {
+                    format!("failed while reading downloaded data for {asset_name}")
+                })?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            temp.write_all(&chunk)
+                .context("failed to write downloaded archive chunk")?;
+            tracker.inc(chunk.len() as u64);
         }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
 
-    if let Some(progress) = progress {
-        progress.finish_and_clear();
-    } else {
-        println!("Finished {asset_name}.");
-    }
+    result?;
+    progress.finish_download(tool_label);
     Ok(temp.into_temp_path())
 }
 
 async fn download_archive_multipart(
     client: &Client,
     url: &str,
-    asset_name: &str,
+    _asset_name: &str,
+    tool_label: &str,
     content_length: u64,
     parts: u64,
+    progress: &ProgressReporter,
 ) -> Result<TempPath> {
-    let progress = ProgressBar::new(content_length);
-    progress.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} {msg} [{bar:32.cyan/blue}] {percent:>3}% {binary_bytes}/{total_bytes} {binary_bytes_per_sec} eta {eta}",
-        )?
-        .progress_chars("=>-"),
-    );
-    progress.set_message(format!("Downloading {asset_name}"));
+    let tracker = progress.start_download(tool_label, content_length);
 
     let temp_dir = tempfile::tempdir().context("failed to create temporary part directory")?;
     let mut tasks = JoinSet::new();
@@ -300,9 +455,9 @@ async fn download_archive_multipart(
         let client = client.clone();
         let url = url.to_string();
         let part_path = temp_dir.path().join(format!("part-{index:02}.bin"));
-        let progress = progress.clone();
+        let tracker = tracker.clone();
         tasks.spawn(async move {
-            download_range_to_file(&client, &url, start, end, &part_path, &progress).await?;
+            download_range_to_file(&client, &url, start, end, &part_path, &tracker).await?;
             Ok::<(u64, PathBuf), anyhow::Error>((index, part_path))
         });
     }
@@ -318,8 +473,9 @@ async fn download_archive_multipart(
     }
     .await;
 
-    progress.finish_and_clear();
-    result
+    let path = result?;
+    progress.finish_download(tool_label);
+    Ok(path)
 }
 
 async fn download_range_to_file(
@@ -328,42 +484,312 @@ async fn download_range_to_file(
     start: u64,
     end: u64,
     part_path: &Path,
-    progress: &ProgressBar,
+    progress: &DownloadTracker,
 ) -> Result<()> {
-    let range_value = format!("bytes={start}-{end}");
-    let mut response = client
-        .get(url)
-        .header(RANGE, range_value)
-        .send()
-        .await
-        .with_context(|| format!("failed to request download range {start}-{end}"))?
-        .error_for_status()
-        .with_context(|| format!("download range returned an error for bytes {start}-{end}"))?;
+    File::create(part_path).with_context(|| format!("failed to create {}", part_path.display()))?;
 
-    if response.status() != StatusCode::PARTIAL_CONTENT {
-        bail!(
-            "server ignored ranged request for bytes {start}-{end} and returned {}",
-            response.status()
+    let expected_len = end - start + 1;
+    let mut written = 0;
+    let mut attempts = 0;
+    let mut last_error = None;
+
+    while written < expected_len {
+        attempts += 1;
+        let request_start = start + written;
+        let range_value = format!("bytes={request_start}-{end}");
+        let response = client.get(url).header(RANGE, range_value).send().await;
+        let mut response = match response {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = Some(anyhow!(
+                        "download range returned an error for bytes {request_start}-{end}: {error}"
+                    ));
+                    if attempts >= RANGE_DOWNLOAD_MAX_ATTEMPTS {
+                        break;
+                    }
+                    sleep(range_retry_delay(attempts)).await;
+                    continue;
+                }
+            },
+            Err(error) => {
+                last_error = Some(anyhow!(
+                    "failed to request download range {request_start}-{end}: {error}"
+                ));
+                if attempts >= RANGE_DOWNLOAD_MAX_ATTEMPTS {
+                    break;
+                }
+                sleep(range_retry_delay(attempts)).await;
+                continue;
+            }
+        };
+
+        if response.status() != StatusCode::PARTIAL_CONTENT {
+            bail!(
+                "server ignored ranged request for bytes {request_start}-{end} and returned {}",
+                response.status()
+            );
+        }
+
+        let mut output = OpenOptions::new()
+            .append(true)
+            .open(part_path)
+            .with_context(|| format!("failed to open {}", part_path.display()))?;
+
+        loop {
+            let chunk = match timeout(DOWNLOAD_IDLE_TIMEOUT, response.chunk()).await {
+                Ok(Ok(Some(chunk))) => chunk,
+                Ok(Ok(None)) => {
+                    if written < expected_len {
+                        last_error = Some(anyhow!(
+                            "download range {request_start}-{end} ended early after {} of {} bytes",
+                            written,
+                            expected_len
+                        ));
+                    }
+                    break;
+                }
+                Ok(Err(error)) => {
+                    last_error = Some(anyhow!(
+                        "failed while reading byte range {request_start}-{end}: {error}"
+                    ));
+                    break;
+                }
+                Err(_) => {
+                    last_error = Some(anyhow!(
+                        "download stalled for byte range {request_start}-{end}: no data received for {} seconds",
+                        DOWNLOAD_IDLE_TIMEOUT.as_secs()
+                    ));
+                    break;
+                }
+            };
+
+            output
+                .write_all(&chunk)
+                .with_context(|| format!("failed to write {}", part_path.display()))?;
+            written += chunk.len() as u64;
+            progress.inc(chunk.len() as u64);
+
+            if written >= expected_len {
+                break;
+            }
+        }
+
+        if written >= expected_len {
+            return Ok(());
+        }
+
+        if attempts >= RANGE_DOWNLOAD_MAX_ATTEMPTS {
+            break;
+        }
+
+        sleep(range_retry_delay(attempts)).await;
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        anyhow!(
+            "download range {start}-{end} incomplete after {} attempts",
+            RANGE_DOWNLOAD_MAX_ATTEMPTS
+        )
+    }))
+    .with_context(|| {
+        format!(
+            "failed to complete byte range {start}-{end} after {} attempts",
+            RANGE_DOWNLOAD_MAX_ATTEMPTS
+        )
+    })
+}
+
+fn range_retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(250 * attempt.min(4) as u64)
+}
+
+impl ProgressReporter {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            inner: Arc::new(Mutex::new(ProgressReporterState {
+                downloads: BTreeMap::new(),
+                last_render: now.checked_sub(PROGRESS_RENDER_INTERVAL).unwrap_or(now),
+                rendered_lines: 0,
+            })),
+        }
+    }
+
+    fn start_download(&self, label: &str, total: u64) -> DownloadTracker {
+        let mut state = self.inner.lock().expect("progress reporter lock poisoned");
+        state.downloads.insert(
+            label.to_string(),
+            DownloadSnapshot {
+                total,
+                downloaded: 0,
+                started: Instant::now(),
+            },
         );
+        render_progress_dashboard(&mut state, true);
+
+        DownloadTracker {
+            reporter: self.clone(),
+            label: label.to_string(),
+        }
     }
 
-    let mut output =
-        File::create(part_path).with_context(|| format!("failed to create {}", part_path.display()))?;
-    while let Some(chunk) = response.chunk().await? {
-        output
-            .write_all(&chunk)
-            .with_context(|| format!("failed to write {}", part_path.display()))?;
-        progress.inc(chunk.len() as u64);
+    fn inc_download(&self, label: &str, amount: u64) {
+        let mut state = self.inner.lock().expect("progress reporter lock poisoned");
+        if let Some(download) = state.downloads.get_mut(label) {
+            download.downloaded = download.downloaded.saturating_add(amount);
+        }
+        render_progress_dashboard(&mut state, false);
     }
 
-    Ok(())
+    fn finish_download(&self, label: &str) {
+        let mut state = self.inner.lock().expect("progress reporter lock poisoned");
+        if let Some(download) = state.downloads.get_mut(label) {
+            if download.total == 0 {
+                download.total = download.downloaded;
+            } else {
+                download.downloaded = download.total;
+            }
+        }
+        render_progress_dashboard(&mut state, true);
+    }
+
+    fn clear(&self) {
+        let mut state = self.inner.lock().expect("progress reporter lock poisoned");
+        clear_rendered_dashboard(&mut state);
+    }
+
+    fn log(&self, message: impl AsRef<str>) {
+        let mut state = self.inner.lock().expect("progress reporter lock poisoned");
+        clear_rendered_dashboard(&mut state);
+        println!("{}", message.as_ref());
+        render_progress_dashboard(&mut state, true);
+    }
+}
+
+impl DownloadTracker {
+    fn inc(&self, amount: u64) {
+        self.reporter.inc_download(&self.label, amount);
+    }
+}
+
+fn render_progress_dashboard(state: &mut ProgressReporterState, force: bool) {
+    if state.downloads.is_empty() {
+        clear_rendered_dashboard(state);
+        return;
+    }
+    if !force && state.last_render.elapsed() < PROGRESS_RENDER_INTERVAL {
+        return;
+    }
+    state.last_render = Instant::now();
+
+    clear_rendered_dashboard(state);
+    for (label, download) in &state.downloads {
+        println!("{}", format_progress_line(label, download));
+    }
+    state.rendered_lines = state.downloads.len();
+    let _ = io::stdout().flush();
+}
+
+fn clear_rendered_dashboard(state: &mut ProgressReporterState) {
+    if state.rendered_lines == 0 {
+        return;
+    }
+
+    print!("\x1b[{}F", state.rendered_lines);
+    for _ in 0..state.rendered_lines {
+        print!("\x1b[2K\x1b[1E");
+    }
+    print!("\x1b[{}F", state.rendered_lines);
+    let _ = io::stdout().flush();
+    state.rendered_lines = 0;
+}
+
+fn format_progress_line(label: &str, download: &DownloadSnapshot) -> String {
+    let percent = if download.total > 0 {
+        download
+            .downloaded
+            .saturating_mul(100)
+            .checked_div(download.total)
+            .unwrap_or(0)
+            .min(100)
+    } else {
+        0
+    };
+    let elapsed = download.started.elapsed().as_secs_f64().max(0.001);
+    let bytes_per_second = (download.downloaded as f64 / elapsed) as u64;
+    let eta = format_eta(download.total, download.downloaded, bytes_per_second);
+
+    format!(
+        "{label:>18} [{}] {percent:>3}% {}/{} {}/s eta {eta}",
+        progress_bar(download.downloaded, download.total, PROGRESS_BAR_WIDTH),
+        HumanBytes(download.downloaded),
+        HumanBytes(download.total),
+        HumanBytes(bytes_per_second)
+    )
+}
+
+fn progress_bar(downloaded: u64, total: u64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if total == 0 {
+        return "-".repeat(width);
+    }
+
+    let filled = downloaded
+        .saturating_mul(width as u64)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(width as u64) as usize;
+
+    if filled >= width {
+        return "=".repeat(width);
+    }
+
+    let mut bar = String::with_capacity(width);
+    bar.push_str(&"=".repeat(filled));
+    bar.push('>');
+    bar.push_str(&"-".repeat(width - filled - 1));
+    bar
+}
+
+fn format_eta(total: u64, downloaded: u64, bytes_per_second: u64) -> String {
+    if total == 0 || downloaded >= total {
+        return "0s".to_string();
+    }
+    if bytes_per_second == 0 {
+        return "?".to_string();
+    }
+
+    let remaining_seconds = total.saturating_sub(downloaded).div_ceil(bytes_per_second);
+    format_duration(Duration::from_secs(remaining_seconds))
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+
+    if hours > 0 {
+        format!("{hours}h{minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn progress_log(progress: &ProgressReporter, message: impl AsRef<str>) {
+    progress.log(message);
 }
 
 fn assemble_archive_from_parts(part_paths: Vec<(u64, PathBuf)>) -> Result<TempPath> {
     let mut archive = NamedTempFile::new().context("failed to create assembled archive")?;
     for (_, path) in part_paths {
-        let mut part = File::open(&path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
+        let mut part =
+            File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
         io::copy(&mut part, archive.as_file_mut())
             .with_context(|| format!("failed to append {}", path.display()))?;
     }
