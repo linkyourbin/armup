@@ -119,7 +119,7 @@ fn analyze_path_merge(root: &Path, current_path: &str, additions: &[PathBuf]) ->
                 legacy_tool_versions_dir(root, kind),
             ]
         })
-        .map(|path| normalize_path_key(&path))
+        .flat_map(|path| managed_root_keys(&path))
         .collect();
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
@@ -169,6 +169,20 @@ fn path_is_under_managed_root(path: &str, managed_root: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('\\'))
 }
 
+fn managed_root_keys(path: &Path) -> Vec<String> {
+    let normalized = normalize_path_key(path);
+    let mut keys = vec![normalized.clone()];
+
+    if normalized.len() >= 3 {
+        let bytes = normalized.as_bytes();
+        if bytes[1] == b':' && bytes[2] == b'\\' && bytes[0].is_ascii_alphabetic() {
+            keys.push(format!("{}{}", &normalized[..2], &normalized[3..]));
+        }
+    }
+
+    keys
+}
+
 #[cfg(test)]
 mod tests {
     use super::{merge_user_path, path_is_under_managed_root};
@@ -199,6 +213,17 @@ mod tests {
             merged,
             r"C:\Windows;D:\Embedded_Toolchain\ninja2\bin;D:\Embedded_Toolchain\ninja\1.12.0"
         );
+    }
+
+    #[test]
+    fn merge_user_path_removes_drive_relative_managed_entries() {
+        let root = PathBuf::from(r"D:\Embedded_Toolchain");
+        let current = r"C:\Windows;D:Embedded_Toolchain\ninja\1.13.2";
+        let additions = vec![PathBuf::from(r"D:\Embedded_Toolchain\ninja\1.13.2")];
+
+        let merged = merge_user_path(&root, current, &additions);
+
+        assert_eq!(merged, r"C:\Windows;D:\Embedded_Toolchain\ninja\1.13.2");
     }
 }
 

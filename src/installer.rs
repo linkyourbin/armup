@@ -233,8 +233,9 @@ pub fn validate_install_root(root: &Path) -> Result<()> {
         bail!("install root cannot be empty");
     }
 
-    if let Some(prefix) = root.components().next() {
-        if let Component::Prefix(prefix) = prefix {
+    let mut components = root.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Prefix(prefix)), Some(Component::RootDir)) => {
             let drive_root = PathBuf::from(format!("{}\\", prefix.as_os_str().to_string_lossy()));
             if !drive_root.exists() {
                 bail!(
@@ -243,6 +244,10 @@ pub fn validate_install_root(root: &Path) -> Result<()> {
                 );
             }
         }
+        _ => bail!(
+            "install root must be an absolute path like D:\\Embedded_Toolchain, got {}",
+            root.display()
+        ),
     }
 
     Ok(())

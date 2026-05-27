@@ -191,18 +191,18 @@ pub fn update_request(args: &UpdateArgs) -> Result<UpdateRequest> {
 
     Ok(UpdateRequest {
         requested_tools,
-        root: args.root.clone().unwrap_or_else(default_install_root),
+        root: normalize_root_path(args.root.clone().unwrap_or_else(default_install_root))?,
         scope: choose_update_scope(args),
         download_config: DownloadConfig::from_connections(args.download_connections),
     })
 }
 
 pub fn status_root(args: &StatusArgs) -> Result<PathBuf> {
-    Ok(args.root.clone().unwrap_or_else(default_install_root))
+    normalize_root_path(args.root.clone().unwrap_or_else(default_install_root))
 }
 
 pub fn doctor_root(args: &DoctorArgs) -> Result<PathBuf> {
-    Ok(args.root.clone().unwrap_or_else(default_install_root))
+    normalize_root_path(args.root.clone().unwrap_or_else(default_install_root))
 }
 
 pub fn choose_versions(options: &[ToolVersionOptions]) -> Result<Vec<ResolvedTool>> {
@@ -308,7 +308,7 @@ fn choose_install_tools(args: &InstallArgs) -> Result<Vec<ToolKind>> {
 
 fn choose_install_root(args: &InstallArgs) -> Result<PathBuf> {
     if let Some(root) = &args.root {
-        return Ok(root.clone());
+        return normalize_root_path(root.clone());
     }
 
     if args.yes || !is_interactive_terminal() {
@@ -369,14 +369,46 @@ pub(crate) fn parse_root_path(raw: &str) -> std::result::Result<PathBuf, String>
 
     #[cfg(windows)]
     {
-        let normalized = trimmed.replace('/', "\\");
-        return Ok(PathBuf::from(normalized));
+        return normalize_windows_root_text(trimmed).map(PathBuf::from);
     }
 
     #[cfg(not(windows))]
     {
         Ok(PathBuf::from(trimmed))
     }
+}
+
+fn normalize_root_path(path: PathBuf) -> Result<PathBuf> {
+    let raw = path.to_string_lossy();
+    parse_root_path(&raw).map_err(anyhow::Error::msg)
+}
+
+#[cfg(windows)]
+fn normalize_windows_root_text(raw: &str) -> std::result::Result<String, String> {
+    let normalized = raw.trim().replace('/', "\\");
+    if normalized.is_empty() {
+        return Err("root path cannot be empty".to_string());
+    }
+
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        if bytes.len() == 2 {
+            return Ok(format!("{normalized}\\"));
+        }
+        if bytes[2] != b'\\' {
+            let (drive, rest) = normalized.split_at(2);
+            return Ok(format!("{drive}\\{rest}"));
+        }
+        return Ok(normalized);
+    }
+
+    if normalized.starts_with(r"\\") {
+        return Ok(normalized);
+    }
+
+    Err(format!(
+        "install root must be an absolute path like D:\\Embedded_Toolchain; got {raw:?}"
+    ))
 }
 
 fn is_interactive_terminal() -> bool {
@@ -420,6 +452,17 @@ mod tests {
     fn parse_root_path_accepts_mixed_separators() {
         let parsed = parse_root_path(r"D:/Embedded\armup").unwrap();
         assert_eq!(parsed, PathBuf::from(r"D:\Embedded\armup"));
+    }
+
+    #[test]
+    fn parse_root_path_repairs_drive_relative_paths_from_bash() {
+        let parsed = parse_root_path(r"D:Embedded_Toolchain").unwrap();
+        assert_eq!(parsed, PathBuf::from(r"D:\Embedded_Toolchain"));
+    }
+
+    #[test]
+    fn parse_root_path_rejects_plain_relative_paths() {
+        assert!(parse_root_path(r"Embedded_Toolchain").is_err());
     }
 
     #[test]
