@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, InvalidHeaderValue, USER_AGENT};
+use reqwest::StatusCode;
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, InvalidHeaderValue, USER_AGENT,
+};
 use reqwest::{Client, Proxy};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -25,6 +28,7 @@ const PROXY_ENV_VARS: &[&str] = &[
     "ALL_PROXY",
     "all_proxy",
 ];
+const GITHUB_TOKEN_ENV_VARS: &[&str] = &["GITHUB_TOKEN", "GH_TOKEN"];
 
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
@@ -46,6 +50,9 @@ pub fn build_client() -> Result<Client> {
         ACCEPT,
         HeaderValue::from_static("application/vnd.github+json, text/html;q=0.9, */*;q=0.8"),
     );
+    if let Some(token) = github_token() {
+        headers.insert(AUTHORIZATION, github_auth_header(&token)?);
+    }
 
     let mut builder = Client::builder()
         .default_headers(headers)
@@ -66,6 +73,19 @@ pub fn build_client() -> Result<Client> {
 
 fn armup_user_agent() -> Result<HeaderValue, InvalidHeaderValue> {
     HeaderValue::from_str(concat!("armup/", env!("CARGO_PKG_VERSION")))
+}
+
+fn github_auth_header(token: &str) -> Result<HeaderValue, InvalidHeaderValue> {
+    HeaderValue::from_str(&format!("Bearer {token}"))
+}
+
+fn github_token() -> Option<String> {
+    GITHUB_TOKEN_ENV_VARS.iter().find_map(|name| {
+        env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn has_proxy_environment() -> bool {
@@ -275,12 +295,19 @@ async fn resolve_github_latest(
     normalize: fn(&str) -> String,
 ) -> Result<ResolvedTool> {
     let api_url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
-    let release = client
+    let response = client
         .get(&api_url)
         .timeout(Duration::from_secs(30))
         .send()
         .await
-        .with_context(|| format!("failed to query GitHub release API for {owner}/{repo}"))?
+        .with_context(|| format!("failed to query GitHub release API for {owner}/{repo}"))?;
+
+    if github_api_response_is_rate_limited(&response) {
+        println!("GitHub API rate-limited for {owner}/{repo}; using release page fallback.");
+        return resolve_github_latest_from_release_page(client, tool, owner, repo, normalize).await;
+    }
+
+    let release = response
         .error_for_status()
         .with_context(|| format!("GitHub release API returned an error for {owner}/{repo}"))?
         .json::<GitHubRelease>()
@@ -302,6 +329,75 @@ async fn resolve_github_latest(
         download_url: asset.browser_download_url,
         checksum: parse_github_digest(asset.digest.as_deref()),
     })
+}
+
+async fn resolve_github_latest_from_release_page(
+    client: &Client,
+    tool: ToolKind,
+    owner: &str,
+    repo: &str,
+    normalize: fn(&str) -> String,
+) -> Result<ResolvedTool> {
+    let latest_url = format!("https://github.com/{owner}/{repo}/releases/latest");
+    let response = client
+        .get(&latest_url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .with_context(|| format!("failed to query GitHub release page for {owner}/{repo}"))?
+        .error_for_status()
+        .with_context(|| format!("GitHub release page returned an error for {owner}/{repo}"))?;
+
+    let tag = extract_github_release_tag(response.url(), owner, repo).with_context(|| {
+        format!(
+            "could not determine latest release tag from {}",
+            response.url()
+        )
+    })?;
+    let version = normalize(&tag);
+    let asset_name = fallback_github_asset_name(tool, &version)
+        .with_context(|| format!("no release page fallback asset pattern for {}", tool.id()))?;
+    let download_url =
+        format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{asset_name}");
+
+    Ok(ResolvedTool {
+        kind: tool,
+        version,
+        asset_name,
+        download_url,
+        checksum: None,
+    })
+}
+
+fn github_api_response_is_rate_limited(response: &reqwest::Response) -> bool {
+    matches!(
+        response.status(),
+        StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+    ) && response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "0")
+}
+
+fn extract_github_release_tag(url: &reqwest::Url, owner: &str, repo: &str) -> Option<String> {
+    let marker = format!("/{owner}/{repo}/releases/tag/");
+    url.path()
+        .strip_prefix(&marker)
+        .and_then(|value| value.split('/').next())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn fallback_github_asset_name(tool: ToolKind, version: &str) -> Option<String> {
+    match tool {
+        ToolKind::Clangd => Some(format!("clangd-windows-{version}.zip")),
+        ToolKind::Cmake => Some(format!("cmake-{version}-windows-x86_64.zip")),
+        ToolKind::Ninja => Some("ninja-win.zip".to_string()),
+        ToolKind::ProbeRs => Some("probe-rs-tools-x86_64-pc-windows-msvc.zip".to_string()),
+        ToolKind::XpackOpenocd => Some(format!("xpack-openocd-{version}-win32-x64.zip")),
+        ToolKind::ArmNoneEabiGcc => None,
+    }
 }
 
 async fn resolve_github_release_options(
@@ -434,7 +530,11 @@ fn extract_sha256_hex(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_sha256_hex, parse_github_digest};
+    use super::{
+        extract_github_release_tag, extract_sha256_hex, fallback_github_asset_name,
+        parse_github_digest,
+    };
+    use crate::tool::ToolKind;
     use crate::types::ChecksumAlgorithm;
 
     #[test]
@@ -481,6 +581,41 @@ mod tests {
         assert_eq!(
             checksum,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn extract_github_release_tag_reads_redirect_url() {
+        let url = reqwest::Url::parse("https://github.com/ninja-build/ninja/releases/tag/v1.13.2")
+            .unwrap();
+
+        assert_eq!(
+            extract_github_release_tag(&url, "ninja-build", "ninja").unwrap(),
+            "v1.13.2"
+        );
+    }
+
+    #[test]
+    fn fallback_github_asset_name_matches_supported_windows_assets() {
+        assert_eq!(
+            fallback_github_asset_name(ToolKind::Clangd, "22.1.0").unwrap(),
+            "clangd-windows-22.1.0.zip"
+        );
+        assert_eq!(
+            fallback_github_asset_name(ToolKind::Cmake, "4.3.3").unwrap(),
+            "cmake-4.3.3-windows-x86_64.zip"
+        );
+        assert_eq!(
+            fallback_github_asset_name(ToolKind::Ninja, "1.13.2").unwrap(),
+            "ninja-win.zip"
+        );
+        assert_eq!(
+            fallback_github_asset_name(ToolKind::ProbeRs, "0.31.0").unwrap(),
+            "probe-rs-tools-x86_64-pc-windows-msvc.zip"
+        );
+        assert_eq!(
+            fallback_github_asset_name(ToolKind::XpackOpenocd, "0.12.0-7").unwrap(),
+            "xpack-openocd-0.12.0-7-win32-x64.zip"
         );
     }
 }
