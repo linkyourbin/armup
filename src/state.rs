@@ -54,6 +54,41 @@ pub fn cleanup_staging_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(removed)
 }
 
+pub fn cleanup_old_tool_versions(
+    root: &Path,
+    keep_versions: &[(ToolKind, String)],
+) -> Result<Vec<PathBuf>> {
+    let mut removed = Vec::new();
+    for (kind, keep_version) in keep_versions {
+        let kind_root = tool_versions_dir(root, *kind);
+        if !kind_root.exists() {
+            continue;
+        }
+
+        for entry in fs::read_dir(&kind_root)
+            .with_context(|| format!("failed to read {}", kind_root.display()))?
+        {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let version = entry.file_name().to_string_lossy().to_string();
+            if version == *keep_version || version.starts_with(".staging-") {
+                continue;
+            }
+
+            let path = entry.path();
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+            removed.push(path);
+        }
+    }
+
+    removed.sort();
+    Ok(removed)
+}
+
 pub fn discover_installed_tools(root: &Path) -> Result<Vec<InstalledTool>> {
     let mut tools = Vec::new();
 
@@ -162,7 +197,9 @@ fn find_file_named(root: &Path, candidates: &[&str]) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_install_root, discover_installed_tools, tool_version_dir};
+    use super::{
+        cleanup_old_tool_versions, default_install_root, discover_installed_tools, tool_version_dir,
+    };
     use crate::tool::ToolKind;
     use std::fs;
     use std::path::PathBuf;
@@ -202,5 +239,39 @@ mod tests {
         assert_eq!(tools[0].kind, ToolKind::Ninja);
         assert_eq!(tools[0].version, "1.12.0");
         assert_eq!(tools[0].executable_path, install_dir.join("ninja.exe"));
+    }
+
+    #[test]
+    fn discover_installed_tools_reads_probe_rs() {
+        let temp = tempdir().unwrap();
+        let install_dir = temp.path().join("probe-rs").join("0.31.0");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::write(install_dir.join("probe-rs.exe"), b"").unwrap();
+
+        let tools = discover_installed_tools(temp.path()).unwrap();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].kind, ToolKind::ProbeRs);
+        assert_eq!(tools[0].version, "0.31.0");
+        assert_eq!(tools[0].executable_path, install_dir.join("probe-rs.exe"));
+    }
+
+    #[test]
+    fn cleanup_old_tool_versions_keeps_selected_version() {
+        let temp = tempdir().unwrap();
+        let old_dir = temp.path().join("ninja").join("1.12.0");
+        let keep_dir = temp.path().join("ninja").join("1.13.2");
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::create_dir_all(&keep_dir).unwrap();
+        fs::create_dir_all(temp.path().join("ninja").join(".staging-1.14.0")).unwrap();
+
+        let removed =
+            cleanup_old_tool_versions(temp.path(), &[(ToolKind::Ninja, "1.13.2".to_string())])
+                .unwrap();
+
+        assert_eq!(removed, vec![old_dir.clone()]);
+        assert!(!old_dir.exists());
+        assert!(keep_dir.exists());
+        assert!(temp.path().join("ninja").join(".staging-1.14.0").exists());
     }
 }

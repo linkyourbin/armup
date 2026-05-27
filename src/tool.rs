@@ -16,6 +16,7 @@ pub enum ToolKind {
     Clangd,
     Cmake,
     Ninja,
+    ProbeRs,
     XpackOpenocd,
 }
 
@@ -26,6 +27,7 @@ impl ToolKind {
             Self::Clangd,
             Self::Cmake,
             Self::Ninja,
+            Self::ProbeRs,
             Self::XpackOpenocd,
         ]
     }
@@ -36,6 +38,7 @@ impl ToolKind {
             Self::Clangd => "clangd",
             Self::Cmake => "cmake",
             Self::Ninja => "ninja",
+            Self::ProbeRs => "probe-rs",
             Self::XpackOpenocd => "xpack-openocd",
         }
     }
@@ -46,6 +49,7 @@ impl ToolKind {
             Self::Clangd => &["clangd.exe"],
             Self::Cmake => &["cmake.exe"],
             Self::Ninja => &["ninja.exe"],
+            Self::ProbeRs => &["probe-rs.exe"],
             Self::XpackOpenocd => &["openocd.exe"],
         }
     }
@@ -61,6 +65,9 @@ impl ToolKind {
                 asset_name.starts_with("cmake-") && asset_name.ends_with("-windows-x86_64.zip")
             }
             Self::Ninja => asset_name.eq_ignore_ascii_case("ninja-win.zip"),
+            Self::ProbeRs => {
+                asset_name.eq_ignore_ascii_case("probe-rs-tools-x86_64-pc-windows-msvc.zip")
+            }
             Self::XpackOpenocd => {
                 asset_name.starts_with("xpack-openocd-") && asset_name.ends_with("-win32-x64.zip")
             }
@@ -76,6 +83,7 @@ impl ToolKind {
             Self::Clangd => "clangd | C/C++ language server".to_string(),
             Self::Cmake => "cmake | Build system generator".to_string(),
             Self::Ninja => "ninja | Fast build executor".to_string(),
+            Self::ProbeRs => "probe-rs | Flash and debug embedded targets".to_string(),
             Self::XpackOpenocd => "xpack-openocd | Debug probe and flash server".to_string(),
         }
     }
@@ -97,6 +105,7 @@ impl FromStr for ToolKind {
             "clangd" => Ok(Self::Clangd),
             "cmake" => Ok(Self::Cmake),
             "ninja" => Ok(Self::Ninja),
+            "probe-rs" | "probe-rs-tools" | "probe" => Ok(Self::ProbeRs),
             "xpack-openocd" | "openocd" => Ok(Self::XpackOpenocd),
             _ => Err(format!("unsupported tool {value:?}")),
         }

@@ -156,6 +156,9 @@ async fn resolve_tool(client: &Client, tool: ToolKind) -> Result<ResolvedTool> {
         ToolKind::Ninja => {
             resolve_github_latest(client, tool, "ninja-build", "ninja", normalize_version).await
         }
+        ToolKind::ProbeRs => {
+            resolve_github_latest(client, tool, "probe-rs", "probe-rs", normalize_version).await
+        }
         ToolKind::XpackOpenocd => {
             resolve_github_latest(
                 client,
@@ -229,6 +232,17 @@ async fn resolve_version_options_for_tool(
                 tool,
                 "ninja-build",
                 "ninja",
+                normalize_version,
+                limit,
+            )
+            .await?
+        }
+        ToolKind::ProbeRs => {
+            resolve_github_release_options(
+                client,
+                tool,
+                "probe-rs",
+                "probe-rs",
                 normalize_version,
                 limit,
             )

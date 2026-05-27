@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -ne "tag") {
+            $version = "manual-${{ github.run_number }}"
+          }
+          $archive = "armup-$version-x86_64-pc-windows-msvc.zip"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\armup.exe dist\armup.exe
+          Compress-Archive -Path dist\armup.exe -DestinationPath $archive -Force
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: armup-windows
+          path: |
+            armup-*-x86_64-pc-windows-msvc.zip
+            armup-*-x86_64-pc-windows-msvc.zip.sha256
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            armup-*-x86_64-pc-windows-msvc.zip
+            armup-*-x86_64-pc-windows-msvc.zip.sha256
+          generate_release_notes: true

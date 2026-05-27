@@ -17,6 +17,7 @@ const MANAGED_ENV_VARS: &[&str] = &[
     "NINJA_ROOT",
     "OPENOCD_ROOT",
     "OPENOCD_SCRIPTS",
+    "PROBE_RS_ROOT",
 ];
 
 pub fn build_env_plan(_root: &Path, tools: &[InstalledTool]) -> Result<EnvPlan> {

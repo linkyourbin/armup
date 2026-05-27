@@ -4,6 +4,7 @@ use dialoguer::{Confirm, Input, MultiSelect, Select, theme::ColorfulTheme};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
+use crate::installer::DownloadConfig;
 use crate::state::default_install_root;
 use crate::tool::{EnvScope, ToolKind};
 use crate::types::{ResolvedTool, ToolVersionOptions};
@@ -25,6 +26,8 @@ pub struct Cli {
 pub enum Commands {
     #[command(about = "Install tools")]
     Install(InstallArgs),
+    #[command(about = "Update installed tools to the latest supported versions")]
+    Update(UpdateArgs),
     #[command(about = "Show installed tools and managed PATH entries")]
     Status(StatusArgs),
     #[command(about = "Check network access, release resolution, and local state")]
@@ -51,18 +54,24 @@ pub struct InstallArgs {
     pub root: Option<PathBuf>,
 
     #[arg(
-        long = "path",
-        conflicts_with = "no_path",
-        help = "Update the user PATH"
+        long = "add-path",
+        conflicts_with_all = ["no_add_path", "legacy_no_path"],
+        help = "Add installed tools to the Windows user Path"
     )]
-    pub path: bool,
+    pub add_path: bool,
 
     #[arg(
-        long = "no-path",
-        conflicts_with = "path",
-        help = "Skip registry PATH changes"
+        long = "no-add-path",
+        conflicts_with_all = ["add_path", "legacy_path"],
+        help = "Skip Windows user Path changes"
     )]
-    pub no_path: bool,
+    pub no_add_path: bool,
+
+    #[arg(long = "path", hide = true, conflicts_with_all = ["no_add_path", "legacy_no_path"])]
+    pub legacy_path: bool,
+
+    #[arg(long = "no-path", hide = true, conflicts_with_all = ["add_path", "legacy_path"])]
+    pub legacy_no_path: bool,
 
     #[arg(long, help = "Use defaults for any missing interactive choices")]
     pub yes: bool,
@@ -72,12 +81,74 @@ pub struct InstallArgs {
         help = "Choose versions from recent upstream releases instead of using latest"
     )]
     pub select_versions: bool,
+
+    #[arg(
+        long = "download-connections",
+        value_name = "N",
+        default_value_t = DownloadConfig::DEFAULT_CONNECTIONS,
+        value_parser = clap::value_parser!(u8).range(1..=DownloadConfig::MAX_CONNECTIONS as i64),
+        help = "Maximum total parallel download connections"
+    )]
+    pub download_connections: u8,
 }
 
 #[derive(Args, Debug, Default)]
 pub struct StatusArgs {
     #[arg(long, value_name = "PATH", help = "Install root")]
     pub root: Option<PathBuf>,
+
+    #[arg(long, short = 'v', help = "Show full executable and PATH entries")]
+    pub verbose: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct UpdateArgs {
+    #[arg(
+        long,
+        conflicts_with = "tools",
+        help = "Update all installed supported tools"
+    )]
+    pub all: bool,
+
+    #[arg(
+        long = "tool",
+        value_name = "TOOL",
+        value_delimiter = ',',
+        help = "Update selected installed tools. May be repeated or comma-separated."
+    )]
+    pub tools: Vec<ToolKind>,
+
+    #[arg(long, value_name = "PATH", help = "Install root")]
+    pub root: Option<PathBuf>,
+
+    #[arg(
+        long = "add-path",
+        conflicts_with_all = ["no_add_path", "legacy_no_path"],
+        help = "Refresh the Windows user Path after updating"
+    )]
+    pub add_path: bool,
+
+    #[arg(
+        long = "no-add-path",
+        conflicts_with_all = ["add_path", "legacy_path"],
+        help = "Skip Windows user Path changes"
+    )]
+    pub no_add_path: bool,
+
+    #[arg(long = "path", hide = true, conflicts_with_all = ["no_add_path", "legacy_no_path"])]
+    pub legacy_path: bool,
+
+    #[arg(long = "no-path", hide = true, conflicts_with_all = ["add_path", "legacy_path"])]
+    pub legacy_no_path: bool,
+
+    #[arg(
+        long = "download-connections",
+        value_name = "N",
+        default_value_t = DownloadConfig::DEFAULT_CONNECTIONS,
+        value_parser = clap::value_parser!(u8).range(1..=DownloadConfig::MAX_CONNECTIONS as i64),
+        help = "Maximum total parallel download connections"
+    )]
+    pub download_connections: u8,
 }
 
 #[derive(Args, Debug, Default)]
@@ -91,6 +162,14 @@ pub struct InstallRequest {
     pub root: PathBuf,
     pub scope: EnvScope,
     pub select_versions: bool,
+    pub download_config: DownloadConfig,
+}
+
+pub struct UpdateRequest {
+    pub requested_tools: Option<Vec<ToolKind>>,
+    pub root: PathBuf,
+    pub scope: EnvScope,
+    pub download_config: DownloadConfig,
 }
 
 pub fn install_request(args: &InstallArgs) -> Result<InstallRequest> {
@@ -99,6 +178,22 @@ pub fn install_request(args: &InstallArgs) -> Result<InstallRequest> {
         root: choose_install_root(args)?,
         scope: choose_install_scope(args)?,
         select_versions: args.select_versions,
+        download_config: DownloadConfig::from_connections(args.download_connections),
+    })
+}
+
+pub fn update_request(args: &UpdateArgs) -> Result<UpdateRequest> {
+    let requested_tools = if args.all || args.tools.is_empty() {
+        None
+    } else {
+        Some(dedup_tools(args.tools.clone()))
+    };
+
+    Ok(UpdateRequest {
+        requested_tools,
+        root: args.root.clone().unwrap_or_else(default_install_root),
+        scope: choose_update_scope(args),
+        download_config: DownloadConfig::from_connections(args.download_connections),
     })
 }
 
@@ -216,17 +311,14 @@ fn choose_install_root(args: &InstallArgs) -> Result<PathBuf> {
         return Ok(root.clone());
     }
 
-    let default_root = default_install_root();
     if args.yes || !is_interactive_terminal() {
-        return Ok(default_root);
+        bail!("install root is required; pass --root <PATH>");
     }
 
     let theme = ColorfulTheme::default();
     println!("Enter the install root. Both / and \\ are accepted.");
-    println!("Press Enter to use the default: {}", default_root.display());
     let raw = Input::<String>::with_theme(&theme)
         .with_prompt("Install root")
-        .default(default_root.display().to_string())
         .report(false)
         .interact_text()
         .context("failed to read install root path")?;
@@ -237,10 +329,10 @@ fn choose_install_root(args: &InstallArgs) -> Result<PathBuf> {
 }
 
 fn choose_install_scope(args: &InstallArgs) -> Result<EnvScope> {
-    if args.no_path {
+    if args.no_add_path || args.legacy_no_path {
         return Ok(EnvScope::None);
     }
-    if args.path || args.yes || !is_interactive_terminal() {
+    if args.add_path || args.legacy_path || args.yes || !is_interactive_terminal() {
         return Ok(EnvScope::User);
     }
 
@@ -258,6 +350,14 @@ fn choose_install_scope(args: &InstallArgs) -> Result<EnvScope> {
     } else {
         println!("PATH setup: skip registry changes.");
         Ok(EnvScope::None)
+    }
+}
+
+fn choose_update_scope(args: &UpdateArgs) -> EnvScope {
+    if args.no_add_path || args.legacy_no_path {
+        EnvScope::None
+    } else {
+        EnvScope::User
     }
 }
 
@@ -295,7 +395,7 @@ fn dedup_tools(tools: Vec<ToolKind>) -> Vec<ToolKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_root_path;
+    use super::{InstallArgs, install_request, parse_root_path};
     use crate::tool::ToolKind;
     use std::path::PathBuf;
 
@@ -333,5 +433,44 @@ mod tests {
             "arm-none-eabi-gcc".parse::<ToolKind>().unwrap(),
             ToolKind::ArmNoneEabiGcc
         );
+        assert_eq!("probe-rs".parse::<ToolKind>().unwrap(), ToolKind::ProbeRs);
+    }
+
+    #[test]
+    fn install_request_deduplicates_repeated_tools() {
+        let args = InstallArgs {
+            tools: vec![
+                ToolKind::ArmNoneEabiGcc,
+                ToolKind::Ninja,
+                ToolKind::ArmNoneEabiGcc,
+            ],
+            root: Some(PathBuf::from(r"D:\Embedded\armup")),
+            no_add_path: true,
+            ..InstallArgs::default()
+        };
+
+        let request = install_request(&args).unwrap();
+
+        assert_eq!(
+            request.tools,
+            vec![ToolKind::ArmNoneEabiGcc, ToolKind::Ninja]
+        );
+    }
+
+    #[test]
+    fn install_request_requires_root_when_yes_is_used() {
+        let args = InstallArgs {
+            all: true,
+            add_path: true,
+            yes: true,
+            ..InstallArgs::default()
+        };
+
+        let error = match install_request(&args) {
+            Ok(_) => panic!("install request should require an explicit root"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("install root is required"));
     }
 }
