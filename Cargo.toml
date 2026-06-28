@@ -1,6 +1,6 @@
 [package]
 name = "armup"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Install embedded Cortex-M tools on Windows"
 license = "MIT"
@@ -8,7 +8,7 @@ readme = "README.md"
 repository = "https://github.com/linkyourbin/armup"
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
 console = "0.16.3"
 dialoguer = "0.12.0"
