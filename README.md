@@ -11,7 +11,7 @@ It installs:
 - `cmake`
 - `ninja`
 - `probe-rs`
-- xPack OpenOCD
+- `xPack OpenOCD`
 
 Ready to go:
 
