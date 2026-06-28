@@ -16,11 +16,11 @@ It installs:
 Ready to go:
 
 ```bash
-armup install --all --root D:\Embedded_Toolchain --add-path --yes --download-connections 24
+armup install -a --root D:\Embedded_Toolchain -j 24
 ```
 
 Update installed tools:
 
 ```bash
-armup update --all --root D:\Embedded_Toolchain --add-path --download-connections 24
+armup update -a --root D:\Embedded_Toolchain -j 24
 ```

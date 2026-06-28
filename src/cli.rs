@@ -37,6 +37,7 @@ pub enum Commands {
 #[derive(Args, Debug, Default)]
 pub struct InstallArgs {
     #[arg(
+        short = 'a',
         long,
         help = "Install all supported tools without asking which tools to install"
     )]
@@ -56,7 +57,7 @@ pub struct InstallArgs {
     #[arg(
         long = "add-path",
         conflicts_with_all = ["no_add_path", "legacy_no_path"],
-        help = "Add installed tools to the Windows user Path"
+        help = "Add installed tools to the Windows user Path (default)"
     )]
     pub add_path: bool,
 
@@ -83,6 +84,7 @@ pub struct InstallArgs {
     pub select_versions: bool,
 
     #[arg(
+        short = 'j',
         long = "download-connections",
         value_name = "N",
         default_value_t = DownloadConfig::DEFAULT_CONNECTIONS,
@@ -104,6 +106,7 @@ pub struct StatusArgs {
 #[derive(Args, Debug, Default)]
 pub struct UpdateArgs {
     #[arg(
+        short = 'a',
         long,
         conflicts_with = "tools",
         help = "Update all installed supported tools"
@@ -142,6 +145,7 @@ pub struct UpdateArgs {
     pub legacy_no_path: bool,
 
     #[arg(
+        short = 'j',
         long = "download-connections",
         value_name = "N",
         default_value_t = DownloadConfig::DEFAULT_CONNECTIONS,
@@ -332,25 +336,7 @@ fn choose_install_scope(args: &InstallArgs) -> Result<EnvScope> {
     if args.no_add_path || args.legacy_no_path {
         return Ok(EnvScope::None);
     }
-    if args.add_path || args.legacy_path || args.yes || !is_interactive_terminal() {
-        return Ok(EnvScope::User);
-    }
-
-    let theme = ColorfulTheme::default();
-    let apply = Confirm::with_theme(&theme)
-        .with_prompt("Add the installed tools to the user PATH?")
-        .default(true)
-        .report(false)
-        .interact()
-        .context("failed to read PATH setup selection")?;
-
-    if apply {
-        println!("PATH setup: apply to current user profile.");
-        Ok(EnvScope::User)
-    } else {
-        println!("PATH setup: skip registry changes.");
-        Ok(EnvScope::None)
-    }
+    Ok(EnvScope::User)
 }
 
 fn choose_update_scope(args: &UpdateArgs) -> EnvScope {
@@ -428,6 +414,7 @@ fn dedup_tools(tools: Vec<ToolKind>) -> Vec<ToolKind> {
 #[cfg(test)]
 mod tests {
     use super::{InstallArgs, install_request, parse_root_path};
+    use crate::tool::EnvScope;
     use crate::tool::ToolKind;
     use std::path::PathBuf;
 
@@ -498,6 +485,33 @@ mod tests {
             request.tools,
             vec![ToolKind::ArmNoneEabiGcc, ToolKind::Ninja]
         );
+    }
+
+    #[test]
+    fn install_request_adds_user_path_by_default() {
+        let args = InstallArgs {
+            all: true,
+            root: Some(PathBuf::from(r"D:\Embedded\armup")),
+            ..InstallArgs::default()
+        };
+
+        let request = install_request(&args).unwrap();
+
+        assert_eq!(request.scope, EnvScope::User);
+    }
+
+    #[test]
+    fn install_request_can_skip_path_changes() {
+        let args = InstallArgs {
+            all: true,
+            root: Some(PathBuf::from(r"D:\Embedded\armup")),
+            no_add_path: true,
+            ..InstallArgs::default()
+        };
+
+        let request = install_request(&args).unwrap();
+
+        assert_eq!(request.scope, EnvScope::None);
     }
 
     #[test]
